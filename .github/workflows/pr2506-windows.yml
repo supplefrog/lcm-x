@@ -11,9 +11,9 @@ jobs:
   unload:
     runs-on: windows-2025
     timeout-minutes: 15
+    environment: pr2506-windows-candidate
     env:
       HERMES_SHA: 5691c9fa47b16a546a5fa418a9e76fddcfbf2701
-      BASELINE_SHA: 9eeb724522bb64bd1663711ac4525196755bff2d
       PR_HEAD_SHA: b457d8b2743c2fe6896cd4fc015e3540819cb3b2
       PYTHONUTF8: '1'
     steps:
@@ -36,8 +36,12 @@ jobs:
             Write-Host "$Directory $Sha"
           }
           Get-Revision hermes-agent https://github.com/NousResearch/hermes-agent.git $env:HERMES_SHA
-          Get-Revision lcm-base https://github.com/electricsheephq/lcm-x.git $env:BASELINE_SHA
-          Get-Revision lcm-x https://github.com/supplefrog/lcm-x.git $env:PR_HEAD_SHA
+          Get-Revision follow-next https://github.com/supplefrog/lcm-x.git $env:PR_HEAD_SHA
+
+      - name: Restore the exact candidate if supplied
+        env:
+          CANDIDATE_CHAIN: ${{ secrets.LCMX_PR2506_BUNDLE_CHAIN }}
+        run: python -B restore_candidate.py
 
       - name: Install the pinned Hermes environment
         run: |
@@ -45,13 +49,27 @@ jobs:
           python -m pip install --disable-pip-version-check uv==0.11.26
           uv sync --project hermes-agent --locked --no-dev --python 3.14
 
-      - name: Prove Windows distinguishes the locked baseline from the PR fix
+      - name: Run Windows unload, reload, and maintainer regression probes
         run: |
-          $PSNativeCommandUseErrorActionPreference = $true
           $hermesPython = Join-Path $PWD 'hermes-agent/.venv/Scripts/python.exe'
-          $env:LCMX_PROOF_SOURCE = 'lcm-base'
-          Write-Host "Locked control: $env:BASELINE_SHA"
-          & $hermesPython -X utf8 -B reproduce.py --expect-bug
-          $env:LCMX_PROOF_SOURCE = 'lcm-x'
-          Write-Host "PR #2506 head: $env:PR_HEAD_SHA"
-          & $hermesPython -X utf8 -B reproduce.py --expect-fixed
+          function Invoke-Probe($Script, $Arguments) {
+            $transcript = & $hermesPython -X utf8 -B $Script @Arguments 2>&1
+            $status = $LASTEXITCODE
+            $transcript | ForEach-Object {
+              if ("$_" -match '^[a-f0-9]{40} upstream [a-z-]+ exit [0-9]+') { Write-Host $Matches[0] }
+              if ("$_" -match '^(Deleted lcm\.db in the live Hermes process|lcm\.db deleted inside live Hermes process)$') { Write-Host $_ }
+            }
+            if ($status -ne 0) {
+              if ($env:TESTED_SHA -eq $env:PR_HEAD_SHA) { $transcript | Write-Host }
+              throw "Windows probe $Script exited $status"
+            }
+          }
+          $env:LCMX_PROOF_SOURCE = 'follow-next'
+          Write-Host "Testing $env:TESTED_SHA on Hermes $env:HERMES_SHA"
+          Invoke-Probe reproduce.py @('--expect-fixed')
+          Write-Host 'Completed-turn unload: SQLite handles released and lcm.db deleted in the live process'
+          Invoke-Probe review-5914142904/native.py @($env:TESTED_SHA, 'upstream', 'new-used', 'preflight-gap', 'compress-gap', 'preflight-clone', 'compress-clone')
+          Invoke-Probe worker-5931574277-evidence/maintainer_native.py @($env:TESTED_SHA, 'upstream', 'resume-finalized-gap', 'branch-gap-close', 'undo-first', 'new-retry')
+          if ($env:TESTED_SHA -ne $env:PR_HEAD_SHA) {
+            Invoke-Probe worker-6965624944-evidence/cooldown_native.py @($env:TESTED_SHA, 'upstream', 'merged-cooldown')
+          }
