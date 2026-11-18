@@ -1,0 +1,57 @@
+name: LCM-X #2506 Windows unload probe
+
+on:
+  push:
+    branches: [verify/pr2506-windows]
+
+permissions:
+  contents: read
+
+jobs:
+  unload:
+    runs-on: windows-2025
+    timeout-minutes: 15
+    env:
+      HERMES_SHA: 5691c9fa47b16a546a5fa418a9e76fddcfbf2701
+      BASELINE_SHA: 9eeb724522bb64bd1663711ac4525196755bff2d
+      PR_HEAD_SHA: b457d8b2743c2fe6896cd4fc015e3540819cb3b2
+      PYTHONUTF8: '1'
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.14'
+
+      - name: Fetch and check the pinned public revisions
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          function Get-Revision($Directory, $Repository, $Sha) {
+            git init --quiet $Directory
+            git -C $Directory fetch --quiet --no-tags --depth=1 $Repository $Sha
+            git -C $Directory checkout --quiet --detach FETCH_HEAD
+            if ((git -C $Directory rev-parse HEAD) -cne $Sha) { throw "Unexpected revision in $Directory" }
+            Write-Host "$Directory $Sha"
+          }
+          Get-Revision hermes-agent https://github.com/NousResearch/hermes-agent.git $env:HERMES_SHA
+          Get-Revision lcm-base https://github.com/electricsheephq/lcm-x.git $env:BASELINE_SHA
+          Get-Revision lcm-x https://github.com/supplefrog/lcm-x.git $env:PR_HEAD_SHA
+
+      - name: Install the pinned Hermes environment
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          python -m pip install --disable-pip-version-check uv==0.11.26
+          uv sync --project hermes-agent --locked --no-dev --python 3.14
+
+      - name: Prove Windows distinguishes the locked baseline from the PR fix
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          $hermesPython = Join-Path $PWD 'hermes-agent/.venv/Scripts/python.exe'
+          $env:LCMX_PROOF_SOURCE = 'lcm-base'
+          Write-Host "Locked control: $env:BASELINE_SHA"
+          & $hermesPython -X utf8 -B reproduce.py --expect-bug
+          $env:LCMX_PROOF_SOURCE = 'lcm-x'
+          Write-Host "PR #2506 head: $env:PR_HEAD_SHA"
+          & $hermesPython -X utf8 -B reproduce.py --expect-fixed
